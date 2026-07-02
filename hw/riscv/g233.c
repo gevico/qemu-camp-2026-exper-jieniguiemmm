@@ -59,6 +59,596 @@
 #include "qapi/qapi-visit-common.h"
 #include "hw/virtio/virtio-iommu.h"
 #include "hw/uefi/var-service-api.h"
+#include "hw/core/irq.h"
+#include "qemu/timer.h"
+
+#define G233_WDT_BASE  0x10010000ULL
+#define G233_GPIO_BASE 0x10012000ULL
+#define G233_PWM_BASE  0x10015000ULL
+#define G233_SPI_BASE  0x10018000ULL
+
+#define G233_WDT_IRQ   4
+#define G233_GPIO_IRQ  2
+#define G233_SPI_IRQ   5
+
+#define G233_TICK_NS   1000000ULL
+
+typedef struct G233GpioState {
+    MemoryRegion mmio;
+    qemu_irq irq;
+    uint32_t dir;
+    uint32_t out;
+    uint32_t ie;
+    uint32_t is;
+    uint32_t trig;
+    uint32_t pol;
+} G233GpioState;
+
+typedef struct G233PwmChannel {
+    uint32_t ctrl;
+    uint32_t period;
+    uint32_t duty;
+    uint64_t start_ns;
+} G233PwmChannel;
+
+typedef struct G233PwmState {
+    MemoryRegion mmio;
+    G233PwmChannel ch[4];
+    uint32_t done;
+} G233PwmState;
+
+typedef struct G233WdtState {
+    MemoryRegion mmio;
+    qemu_irq irq;
+    uint32_t ctrl;
+    uint32_t load;
+    uint32_t sr;
+    uint64_t start_ns;
+    bool locked;
+} G233WdtState;
+
+typedef struct G233SpiFlash {
+    uint8_t *data;
+    uint32_t size;
+    uint8_t id[3];
+    bool wel;
+    uint8_t cmd;
+    uint8_t phase;
+    uint32_t addr;
+    uint32_t pos;
+} G233SpiFlash;
+
+typedef struct G233SpiState {
+    MemoryRegion mmio;
+    qemu_irq irq;
+    uint32_t cr1;
+    uint32_t cr2;
+    uint32_t sr;
+    uint8_t rx;
+    int cs;
+    G233SpiFlash flash[2];
+} G233SpiState;
+
+static uint32_t g233_gpio_in(G233GpioState *s)
+{
+    return s->out & s->dir;
+}
+
+static void g233_gpio_update_irq(G233GpioState *s)
+{
+    qemu_set_irq(s->irq, s->is != 0);
+}
+
+static void g233_gpio_update_interrupts(G233GpioState *s, uint32_t old_in)
+{
+    uint32_t new_in = g233_gpio_in(s);
+    uint32_t enabled = s->ie;
+    uint32_t level = enabled & s->trig;
+    uint32_t edge = enabled & ~s->trig;
+    uint32_t active_high = s->pol;
+    uint32_t level_active = (new_in & active_high) | (~new_in & ~active_high);
+    uint32_t edge_active = ((~old_in & new_in) & active_high) |
+                           ((old_in & ~new_in) & ~active_high);
+
+    s->is &= ~level;
+    s->is |= level & level_active;
+    s->is |= edge & edge_active;
+    g233_gpio_update_irq(s);
+}
+
+static uint64_t g233_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    G233GpioState *s = opaque;
+
+    switch (addr) {
+    case 0x00:
+        return s->dir;
+    case 0x04:
+        return s->out;
+    case 0x08:
+        return g233_gpio_in(s);
+    case 0x0c:
+        return s->ie;
+    case 0x10:
+        return s->is;
+    case 0x14:
+        return s->trig;
+    case 0x18:
+        return s->pol;
+    default:
+        return 0;
+    }
+}
+
+static void g233_gpio_write(void *opaque, hwaddr addr,
+                            uint64_t value, unsigned int size)
+{
+    G233GpioState *s = opaque;
+    uint32_t old_in = g233_gpio_in(s);
+
+    switch (addr) {
+    case 0x00:
+        s->dir = value;
+        break;
+    case 0x04:
+        s->out = value;
+        break;
+    case 0x0c:
+        s->ie = value;
+        s->is &= s->ie;
+        break;
+    case 0x10:
+        s->is &= ~(uint32_t)value;
+        break;
+    case 0x14:
+        s->trig = value;
+        break;
+    case 0x18:
+        s->pol = value;
+        break;
+    default:
+        break;
+    }
+
+    g233_gpio_update_interrupts(s, old_in);
+}
+
+static const MemoryRegionOps g233_gpio_ops = {
+    .read = g233_gpio_read,
+    .write = g233_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static uint32_t g233_pwm_counter(G233PwmState *s, int ch)
+{
+    G233PwmChannel *c = &s->ch[ch];
+    uint64_t ticks;
+
+    if (!(c->ctrl & 1) || c->period == 0) {
+        return 0;
+    }
+
+    ticks = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - c->start_ns) /
+            G233_TICK_NS;
+    if (ticks >= c->period) {
+        s->done |= 1u << ch;
+    }
+    return ticks % c->period;
+}
+
+static uint32_t g233_pwm_glb(G233PwmState *s)
+{
+    uint32_t glb = s->done << 4;
+
+    for (int i = 0; i < 4; i++) {
+        g233_pwm_counter(s, i);
+        if (s->ch[i].ctrl & 1) {
+            glb |= 1u << i;
+        }
+    }
+    return (s->done << 4) | (glb & 0xf);
+}
+
+static uint64_t g233_pwm_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    G233PwmState *s = opaque;
+    int ch;
+    hwaddr off;
+
+    if (addr == 0) {
+        return g233_pwm_glb(s);
+    }
+    if (addr < 0x10 || addr >= 0x50) {
+        return 0;
+    }
+
+    ch = (addr - 0x10) / 0x10;
+    off = (addr - 0x10) % 0x10;
+    switch (off) {
+    case 0x00:
+        return s->ch[ch].ctrl;
+    case 0x04:
+        return s->ch[ch].period;
+    case 0x08:
+        return s->ch[ch].duty;
+    case 0x0c:
+        return g233_pwm_counter(s, ch);
+    default:
+        return 0;
+    }
+}
+
+static void g233_pwm_write(void *opaque, hwaddr addr,
+                           uint64_t value, unsigned int size)
+{
+    G233PwmState *s = opaque;
+    int ch;
+    hwaddr off;
+
+    if (addr == 0) {
+        uint32_t clear = ((uint32_t)value >> 4) & 0xf;
+        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        s->done &= ~clear;
+        for (int i = 0; i < 4; i++) {
+            if (clear & (1u << i)) {
+                s->ch[i].start_ns = now;
+            }
+        }
+        return;
+    }
+    if (addr < 0x10 || addr >= 0x50) {
+        return;
+    }
+
+    ch = (addr - 0x10) / 0x10;
+    off = (addr - 0x10) % 0x10;
+    switch (off) {
+    case 0x00:
+        if (!(s->ch[ch].ctrl & 1) && (value & 1)) {
+            s->ch[ch].start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+        s->ch[ch].ctrl = value & 0x3;
+        break;
+    case 0x04:
+        s->ch[ch].period = value;
+        break;
+    case 0x08:
+        s->ch[ch].duty = value;
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps g233_pwm_ops = {
+    .read = g233_pwm_read,
+    .write = g233_pwm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void g233_wdt_update(G233WdtState *s)
+{
+    uint64_t ticks;
+
+    if (!(s->ctrl & 1) || s->load == 0 || (s->sr & 1)) {
+        return;
+    }
+
+    ticks = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->start_ns) /
+            G233_TICK_NS;
+    if (ticks >= s->load) {
+        s->sr |= 1;
+        qemu_set_irq(s->irq, (s->ctrl & 2) != 0);
+    }
+}
+
+static uint32_t g233_wdt_val(G233WdtState *s)
+{
+    uint64_t ticks;
+
+    g233_wdt_update(s);
+    if (!(s->ctrl & 1) || s->load == 0) {
+        return s->load;
+    }
+    if (s->sr & 1) {
+        return 0;
+    }
+
+    ticks = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->start_ns) /
+            G233_TICK_NS;
+    return ticks >= s->load ? 0 : s->load - ticks;
+}
+
+static uint64_t g233_wdt_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    G233WdtState *s = opaque;
+
+    switch (addr) {
+    case 0x00:
+        return s->ctrl;
+    case 0x04:
+        return s->load;
+    case 0x08:
+        return g233_wdt_val(s);
+    case 0x0c:
+        g233_wdt_update(s);
+        return s->sr;
+    default:
+        return 0;
+    }
+}
+
+static void g233_wdt_write(void *opaque, hwaddr addr,
+                           uint64_t value, unsigned int size)
+{
+    G233WdtState *s = opaque;
+
+    switch (addr) {
+    case 0x00:
+        if (!s->locked) {
+            if (!(s->ctrl & 1) && (value & 1)) {
+                s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            }
+            s->ctrl = value & 0x3;
+            if (!(s->ctrl & 2)) {
+                qemu_set_irq(s->irq, 0);
+            }
+        }
+        break;
+    case 0x04:
+        if (!s->locked) {
+            s->load = value;
+            s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+        break;
+    case 0x0c:
+        s->sr &= ~(uint32_t)value;
+        if (!(s->sr & 1)) {
+            s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            qemu_set_irq(s->irq, 0);
+        }
+        break;
+    case 0x10:
+        if (value == 0x5a5a5a5a) {
+            s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->sr &= ~1u;
+            qemu_set_irq(s->irq, 0);
+        } else if (value == 0x1acce551) {
+            s->locked = true;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps g233_wdt_ops = {
+    .read = g233_wdt_read,
+    .write = g233_wdt_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void g233_spi_flash_reset_command(G233SpiFlash *f)
+{
+    f->cmd = 0;
+    f->phase = 0;
+    f->addr = 0;
+    f->pos = 0;
+}
+
+static void g233_spi_update_irq(G233SpiState *s)
+{
+    bool level = ((s->cr1 & (1u << 7)) && (s->sr & (1u << 1))) ||
+                 ((s->cr1 & (1u << 6)) && (s->sr & (1u << 0))) ||
+                 ((s->cr1 & (1u << 5)) && (s->sr & (1u << 4)));
+
+    qemu_set_irq(s->irq, level);
+}
+
+static uint8_t g233_spi_flash_xfer(G233SpiFlash *f, uint8_t tx)
+{
+    uint32_t addr;
+    uint8_t ret = 0;
+
+    if (f->cmd == 0) {
+        f->cmd = tx;
+        f->phase = 0;
+        f->addr = 0;
+        f->pos = 0;
+        if (tx == 0x06) {
+            f->wel = true;
+        }
+        return 0;
+    }
+
+    switch (f->cmd) {
+    case 0x05:
+        ret = f->wel ? 0x02 : 0x00;
+        break;
+    case 0x9f:
+        ret = f->pos < 3 ? f->id[f->pos] : 0xff;
+        f->pos++;
+        break;
+    case 0x03:
+        if (f->phase < 3) {
+            f->addr = (f->addr << 8) | tx;
+            f->phase++;
+        } else {
+            addr = (f->addr + f->pos) % f->size;
+            ret = f->data[addr];
+            f->pos++;
+        }
+        break;
+    case 0x02:
+        if (f->phase < 3) {
+            f->addr = (f->addr << 8) | tx;
+            f->phase++;
+        } else if (f->wel) {
+            addr = (f->addr + f->pos) % f->size;
+            f->data[addr] &= tx;
+            f->pos++;
+        }
+        break;
+    case 0x20:
+        if (f->phase < 3) {
+            f->addr = (f->addr << 8) | tx;
+            f->phase++;
+            if (f->phase == 3 && f->wel) {
+                addr = f->addr & ~(uint32_t)0xfff;
+                for (uint32_t i = 0; i < 4096 && addr + i < f->size; i++) {
+                    f->data[addr + i] = 0xff;
+                }
+                f->wel = false;
+            }
+        }
+        break;
+    default:
+        ret = 0xff;
+        break;
+    }
+
+    return ret;
+}
+
+static void g233_spi_select(G233SpiState *s, int cs)
+{
+    if (cs == s->cs) {
+        return;
+    }
+
+    if (s->cs >= 0 && s->cs < 2) {
+        if (s->flash[s->cs].cmd == 0x02) {
+            s->flash[s->cs].wel = false;
+        }
+        g233_spi_flash_reset_command(&s->flash[s->cs]);
+    }
+    s->cs = cs;
+    if (s->cs >= 0 && s->cs < 2) {
+        g233_spi_flash_reset_command(&s->flash[s->cs]);
+    }
+}
+
+static uint64_t g233_spi_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    G233SpiState *s = opaque;
+    uint32_t ret;
+
+    switch (addr) {
+    case 0x00:
+        return s->cr1;
+    case 0x04:
+        return s->cr2;
+    case 0x08:
+        return s->sr;
+    case 0x0c:
+        ret = s->rx;
+        s->sr &= ~(1u << 0);
+        g233_spi_update_irq(s);
+        return ret;
+    default:
+        return 0;
+    }
+}
+
+static void g233_spi_write(void *opaque, hwaddr addr,
+                           uint64_t value, unsigned int size)
+{
+    G233SpiState *s = opaque;
+    uint8_t rx = 0xff;
+
+    switch (addr) {
+    case 0x00:
+        s->cr1 = value & 0xe5;
+        break;
+    case 0x04:
+        s->cr2 = value & 0x3;
+        g233_spi_select(s, s->cr2 & 0x3);
+        break;
+    case 0x08:
+        s->sr &= ~((uint32_t)value & (1u << 4));
+        break;
+    case 0x0c:
+        if (s->sr & (1u << 0)) {
+            s->sr |= 1u << 4;
+        }
+        if ((s->cr1 & 0x5) == 0x5 && s->cs >= 0 && s->cs < 2) {
+            rx = g233_spi_flash_xfer(&s->flash[s->cs], value);
+        }
+        s->rx = rx;
+        s->sr |= (1u << 0) | (1u << 1);
+        break;
+    default:
+        break;
+    }
+
+    g233_spi_update_irq(s);
+}
+
+static const MemoryRegionOps g233_spi_ops = {
+    .read = g233_spi_read,
+    .write = g233_spi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void g233_create_mmio_devices(RISCVG233State *s, DeviceState *irqchip)
+{
+    MemoryRegion *sysmem = get_system_memory();
+    G233GpioState *gpio = g_new0(G233GpioState, 1);
+    G233PwmState *pwm = g_new0(G233PwmState, 1);
+    G233WdtState *wdt = g_new0(G233WdtState, 1);
+    G233SpiState *spi = g_new0(G233SpiState, 1);
+
+    gpio->irq = qdev_get_gpio_in(irqchip, G233_GPIO_IRQ);
+    memory_region_init_io(&gpio->mmio, OBJECT(s), &g233_gpio_ops, gpio,
+                          "g233.gpio", 0x1000);
+    memory_region_add_subregion(sysmem, G233_GPIO_BASE, &gpio->mmio);
+
+    memory_region_init_io(&pwm->mmio, OBJECT(s), &g233_pwm_ops, pwm,
+                          "g233.pwm", 0x1000);
+    memory_region_add_subregion(sysmem, G233_PWM_BASE, &pwm->mmio);
+
+    wdt->irq = qdev_get_gpio_in(irqchip, G233_WDT_IRQ);
+    memory_region_init_io(&wdt->mmio, OBJECT(s), &g233_wdt_ops, wdt,
+                          "g233.wdt", 0x1000);
+    memory_region_add_subregion(sysmem, G233_WDT_BASE, &wdt->mmio);
+
+    spi->irq = qdev_get_gpio_in(irqchip, G233_SPI_IRQ);
+    spi->sr = 1u << 1;
+    spi->cs = -1;
+    spi->flash[0].size = 2 * MiB;
+    spi->flash[0].id[0] = 0xef;
+    spi->flash[0].id[1] = 0x30;
+    spi->flash[0].id[2] = 0x15;
+    spi->flash[1].size = 4 * MiB;
+    spi->flash[1].id[0] = 0xef;
+    spi->flash[1].id[1] = 0x30;
+    spi->flash[1].id[2] = 0x16;
+    for (int i = 0; i < 2; i++) {
+        spi->flash[i].data = g_malloc0(spi->flash[i].size);
+        memset(spi->flash[i].data, 0xff, spi->flash[i].size);
+    }
+    g233_spi_select(spi, 0);
+    memory_region_init_io(&spi->mmio, OBJECT(s), &g233_spi_ops, spi,
+                          "g233.spi", 0x1000);
+    memory_region_add_subregion(sysmem, G233_SPI_BASE, &spi->mmio);
+}
 
 /* KVM AIA only supports APLIC MSI. APLIC Wired is always emulated by QEMU. */
 static bool g233_use_kvm_aia_aplic_imsic(RISCVG233AIAType aia_type)
@@ -1714,6 +2304,8 @@ static void virt_machine_init(MachineState *machine)
 
     sysbus_create_simple("goldfish_rtc", s->memmap[VIRT_RTC].base,
         qdev_get_gpio_in(mmio_irqchip, RTC_IRQ));
+
+    g233_create_mmio_devices(s, mmio_irqchip);
 
     for (i = 0; i < ARRAY_SIZE(s->flash); i++) {
         /* Map legacy -drive if=pflash to machine properties */
